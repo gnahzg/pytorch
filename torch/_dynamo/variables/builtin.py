@@ -886,7 +886,6 @@ class BuiltinVariable(VariableTracker):
                         and left.exc_type is not right.exc_type
                     ):
                         return ConstantVariable.create(op(left, right))
-                    return None
 
                 result.append(((VariableTracker, VariableTracker), handle_is))  # type: ignore[arg-type]
 
