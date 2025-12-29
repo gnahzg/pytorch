@@ -33,6 +33,11 @@ class FakeScriptObject:
             real_obj = x
         object.__setattr__(self, "real_obj", real_obj)
 
+    @property
+    def __class__(self):
+        # HACK
+        return type(self.__dict__["real_obj"])
+
     def __getattribute__(self, name):
         try:
             return super().__getattribute__(name)

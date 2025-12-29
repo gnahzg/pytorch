@@ -1401,3 +1401,42 @@ def zeros(  # type: ignore[no-untyped-def]
         device_mesh=device_mesh,
         placements=placements,
     )
+
+
+from torch._library.opaque_object import MemberType, register_opaque_type
+
+
+register_opaque_type(
+    DeviceMesh,
+    typ="reference",
+    members={
+        # GUARDED: Guard on these attributes (recompile if they change)
+        "_flatten_rank_map": MemberType.GUARDED,
+        "_layout": MemberType.GUARDED,
+        "_device_type": MemberType.GUARDED,
+        "_mesh_dim_names": MemberType.GUARDED,
+        "_thread_id": MemberType.GUARDED,
+        # CONSTANT: these all return constant results
+        "get_rank": MemberType.CONSTANT,
+        "size": MemberType.CONSTANT,
+        "get_coordinate": MemberType.CONSTANT,
+        "get_local_rank": MemberType.CONSTANT,
+        "__eq__": MemberType.CONSTANT,
+        "ndim": MemberType.CONSTANT,
+        "shape": MemberType.CONSTANT,
+        "mesh_dim_names": MemberType.CONSTANT,
+        "get_group": MemberType.CONSTANT,
+        # INLINED: Inline these methods without guards
+        "_coordinate_on_dim": MemberType.INLINED,
+        "_dim_group_names": MemberType.INLINED,
+        "_flatten_mapping": MemberType.INLINED,
+        "_rank_map": MemberType.INLINED,
+        "_root_mesh": MemberType.INLINED,
+        "device_type": MemberType.INLINED,
+        "mesh": MemberType.INLINED,
+        "_flatten": MemberType.INLINED,
+        "_unflatten": MemberType.INLINED,
+        "_get_mesh_dim_by_name": MemberType.INLINED,
+        "_get_root_mesh": MemberType.INLINED,
+    },
+)
