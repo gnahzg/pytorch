@@ -13,7 +13,7 @@ import sympy
 import torch
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._triton import has_triton_stable_tma_api
+from torch.utils._triton import get_triton_version, has_triton_stable_tma_api
 
 from .. import config, config as inductor_config
 from ..kernel.bmm import bmm_template
@@ -651,8 +651,48 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
         return scaled_configs
 
+    def get_shared_memory_estimation(
+        self,
+        gemm_config: BaseConfig,
+        dtype_size: int,
+        has_sm_layout_conversion: bool,
+        layout_conversion_byte_size: int,
+    ):
+        shared_mem_loads = dtype_size * (
+            gemm_config.block_m * gemm_config.block_k
+            + gemm_config.block_n * gemm_config.block_k
+        )
+
+        # In persistent tma case, the layout conversion from mma -> blocked layout
+        # is not free and takes additional shared memory, while next loads are prefetched
+        # For addmm, the conversion is in the acc dtype, as it is needed before the bias addition
+        # For mm, the conversion is in the output dtype, as it happens before the store
+        if has_sm_layout_conversion:
+            capability = torch.cuda.get_device_capability()
+            if capability == (9, 0):
+                # 4 warps per warp group for mma
+                warp_groups = gemm_config.num_warps // 4
+                # M=64 for mma instruction on H100
+                max_epilogue_rows = warp_groups * 64
+            else:
+                # TODO (PaulZhang12): Determine shared memory epilogue usage on blackwell
+                # from mma layout conversion
+                max_epilogue_rows = gemm_config.block_m
+            # How many rows that get converted in smem at a time. Smallest granularity
+            # is 1 warp group due to mma
+            block_m_mma = min(gemm_config.block_m, max_epilogue_rows)
+            shared_mem_epilogue = (
+                layout_conversion_byte_size * block_m_mma * gemm_config.block_n
+            )
+        else:
+            shared_mem_epilogue = 0
+
+        return shared_mem_loads * gemm_config.num_stages + shared_mem_epilogue
+
     def _get_exceeding_shared_memory_checker(
         self,
+        has_sm_layout_conversion: bool,
+        layout_conversion_byte_size: int,
     ) -> Optional[Callable[[BaseConfig, int], bool]]:
         """
         Returns a function that checks whether a given configuration exceeds the available shared memory for the device.
@@ -675,11 +715,15 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
         # TODO make a BaseDeviceConfigHeuristics to handle different device configuration in its own implementation.
         def exceeds(gemm_config: BaseConfig, dtype_size: int) -> bool:
-            shared_mem_accum = dtype_size * (
-                gemm_config.block_m * gemm_config.block_k
-                + gemm_config.block_n * gemm_config.block_k
+            return (
+                self.get_shared_memory_estimation(
+                    gemm_config,
+                    dtype_size,
+                    has_sm_layout_conversion,
+                    layout_conversion_byte_size,
+                )
+                > sm_available
             )
-            return shared_mem_accum * gemm_config.num_stages > sm_available
 
         return exceeds
 
@@ -687,31 +731,26 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         self,
         configs: list[BaseConfig],
         dtype_size: int,
+        has_sm_layout_conversion: bool = False,
+        layout_conversion_byte_size: int = 0,
     ) -> list[BaseConfig]:
         if dtype_size <= 0:
             return configs
 
-        is_exceeding_shared_memory = self._get_exceeding_shared_memory_checker()
+        is_exceeding_shared_memory = self._get_exceeding_shared_memory_checker(
+            has_sm_layout_conversion, layout_conversion_byte_size
+        )
         if is_exceeding_shared_memory is None:
             return configs
 
         return [c for c in configs if not is_exceeding_shared_memory(c, dtype_size)]
 
-    def _prune_exhaustive_configs(
+    def _prune_reg_spill_configs(
         self,
         configs: list[BaseConfig],
-        dtype_size: int,
     ) -> list[BaseConfig]:
-        is_exceeding_shared_memory = self._get_exceeding_shared_memory_checker()
-
         pruned_configs = []
         for gemm_config in configs:
-            # Will use more shared memory than available
-            if is_exceeding_shared_memory and is_exceeding_shared_memory(
-                gemm_config, dtype_size
-            ):
-                continue
-
             NUM_REG = 255
             acc_regs = math.ceil(
                 gemm_config.block_m * gemm_config.block_n / (gemm_config.num_warps * 32)
@@ -744,6 +783,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         ] = lambda m, n, k: False,
         dtype_size: int = 0,
         op_name: str = "mm",  # For preprocessing overrides e.g. on CPU
+        **kwargs,
     ) -> Generator[TritonConfig, None, None]:
         configs = self._filter_configs(configs)
         scaled_configs = self._scale_mm_configs(
@@ -751,14 +791,19 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         )
 
         # Filter out configs that require more shared memory than is available.
-        if config.max_autotune_prune_choices_based_on_shared_mem:
+        if (
+            config.max_autotune_prune_choices_based_on_shared_mem
+            or config.max_autotune_gemm_search_space == "EXHAUSTIVE"
+        ):
             scaled_configs = self._prune_exceeding_max_shared_mem_configs(
-                scaled_configs, dtype_size
+                scaled_configs,
+                dtype_size,
+                kwargs.get("has_sm_layout_conversion", False),
+                kwargs.get("layout_conversion_byte_size", 0),
             )
 
         if config.max_autotune_gemm_search_space == "EXHAUSTIVE":
-            assert dtype_size > 0, "dtype_size must be provided for exhaustive search"
-            scaled_configs = self._prune_exhaustive_configs(scaled_configs, dtype_size)
+            scaled_configs = self._prune_reg_spill_configs(scaled_configs)
         return self._finalize_mm_configs(scaled_configs)
 
     def triton_config(
@@ -893,6 +938,7 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
         ] = lambda m, n, k: False,
         dtype_size: int = 0,
         op_name: str = "mm",  # For preprocessing overrides e.g. on CPU
+        **kwargs,
     ) -> Generator[TritonConfig, None, None]:
         """
         CPU-specific preprocessing that applies CPU-specific scaling (0.5) and exclusion logic.
@@ -911,6 +957,7 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
             exclude=cpu_exclude_fn,
             dtype_size=dtype_size,
             op_name=op_name,
+            **kwargs,
         )
 
 
@@ -1639,6 +1686,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Convert config lists to template kwargs.
@@ -1663,7 +1711,14 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         configs = self._get_config_generator()
 
         # Generate and process configs
-        for c in configs(m, n, k, dtype_size=dtype.itemsize, op_name=op_name):
+        for c in configs(
+            m,
+            n,
+            k,
+            dtype_size=dtype.itemsize,
+            op_name=op_name,
+            **kwargs,
+        ):
             template_kwargs = self._convert_config_to_template_kwargs(
                 c,
                 m,
@@ -1744,15 +1799,20 @@ class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
         m, n, k = kernel_inputs.mnk_symbolic()
-        for kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name, **kwargs
+        ):
             # Apply BLOCK_K constraint specific to mm_plus_mm
             # see https://github.com/triton-lang/triton/issues/1298
             # BLOCK_K = K causes llvm error
-            if V.graph.sizevars.statically_known_lt(kwargs.get("BLOCK_K", k), k):
-                yield kwargs
+            if V.graph.sizevars.statically_known_lt(
+                template_kwargs.get("BLOCK_K", k), k
+            ):
+                yield template_kwargs
 
 
 class TMAWorkspaceMixin(MMTemplateConfigMixin):
@@ -1782,6 +1842,18 @@ class TMAWorkspaceMixin(MMTemplateConfigMixin):
         return super()._filter_configs(configs)
 
 
+def get_shared_memory_checker_opts(op_name: str, dtype_size: int):
+    _, minor = get_triton_version()
+    return {
+        "has_sm_layout_conversion": True,
+        # addmm requires the acc dtype for layout conversion due to adding bias
+        # mm just input dtype
+        "layout_conversion_byte_size": 4
+        if op_name == "addmm" and minor <= 3
+        else dtype_size,
+    }
+
+
 # TMA-specific mixin for TMA templates
 class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
     """
@@ -1793,6 +1865,7 @@ class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Generate TMA template configs by calling super and adding TMA-specific options.
@@ -1810,10 +1883,14 @@ class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
             "tma_store": config.triton.enable_template_tma_store,
             "transpose_discontiguous_tensor_descriptors_override": True,
         }
+
         # Get base template configs from superclass
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs,
             op_name,
+            **get_shared_memory_checker_opts(
+                op_name, dtype_size=kernel_inputs.dtype().itemsize
+            ),
         ):
             yield {**template_kwargs, **tma_opts}
 
@@ -1824,6 +1901,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Generate TMA template configs by calling super and adding TMA-specific options.
@@ -1837,6 +1915,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs,
             op_name,
+            **kwargs,
         ):
             # Some Triton versions requires num_warps >= 4 for WS
             # to avoid compilation issues. Triton disables WS if num_warps < 4
@@ -1897,6 +1976,7 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Generate scaled MM template configs with scaled MM-specific options.
@@ -1940,7 +2020,7 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
 
         # Get base template configs from superclass
         for template_kwargs in super()._get_template_configs_impl(
-            kernel_inputs, op_name
+            kernel_inputs, op_name, **kwargs
         ):
             # Add scaled MM-specific options (moved from mm_common.scaled_mm_options)
             # Override accumulator type for scaled MM
@@ -2028,6 +2108,7 @@ class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Generate scaled TMA template configs with both scaled MM and TMA-specific options.
@@ -2036,6 +2117,7 @@ class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs,
             op_name,
+            **kwargs,
         ):
             # Add TMA-specific options for device TMA scaled MM
             template_kwargs["TMA_SIZE"] = TMA_DESCRIPTOR_SIZE
@@ -2234,6 +2316,7 @@ class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
+        **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
         """
         Generate main loop scaling kernel inputs.
@@ -2251,6 +2334,7 @@ class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs,
             op_name,
+            **kwargs,
         ):
             # Add scaling-specific options for main loop scaling variants
 
